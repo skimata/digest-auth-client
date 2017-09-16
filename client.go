@@ -91,14 +91,8 @@ func (c *Client) ApplyAuth(req *http.Request) error {
 		return err
 	}
 
-	// generate the header
-	hdrVal := dr.printHeaderVal()
-	if c.Opaque != "" {
-		hdrVal = fmt.Sprintf(`%s, opaque="%s"`, hdrVal, c.Opaque)
-	}
-
-	// apply the header
-	req.Header.Set(authHeader, hdrVal)
+	// generate & apply the header
+	req.Header.Set(authHeader, dr.printHeaderVal())
 
 	return nil
 }
@@ -225,6 +219,11 @@ func (dr *digestResponse) printHeaderVal() string {
 			dr.Cnonce, dr.NC, dr.QOP,
 		))
 	}
+
+	if dr.Opaque != "" {
+		hdrVal = fmt.Sprintf(`%s, opaque="%s"`, hdrVal, dr.Opaque)
+	}
+
 	return hdrVal
 }
 
