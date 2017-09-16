@@ -18,20 +18,29 @@ func TestDigestAuthConn(t *testing.T) {
 	challengeVal := fmt.Sprintf("%s %s", digestPrefix, sampleChallegeData)
 	ts := httptest.NewTLSServer(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Add(authChallengeHeader, challengeVal)
-			w.WriteHeader(http.StatusUnauthorized)
+			if r.Header.Get(authHeader) == "" {
+				w.Header().Add(authChallengeHeader, challengeVal)
+				w.WriteHeader(http.StatusUnauthorized)
+			}
 		}),
 	)
 	defer ts.Close()
 
-	dac := DigestAuthClient{
+	c := Client{
 		username: "foo",
 		password: "bar",
 
 		httpCaller: ts.Client(), // http.DefaultClient,
 	}
 
-	if err := dac.Conn(ts.URL); err != nil {
+	req, err := http.NewRequest(http.MethodGet, ts.URL, nil)
+	if err != nil {
 		t.Error(err)
 	}
+
+	resp, err := c.AuthedDo(req)
+	if err != nil {
+		t.Error(err)
+	}
+	t.Logf("resp %#v\n", resp)
 }

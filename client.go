@@ -3,27 +3,30 @@ package digestauth
 import (
 	"crypto/md5"
 	"crypto/rand"
-	"regexp"
-
 	"encoding/json"
 	"fmt"
+	"hash"
 	"io"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 )
-
-// https://tools.ietf.org/html/rfc2617
 
 const (
 	authChallengeHeader = "WWW-Authenticate"
 	authHeader          = "Authorization"
 	digestPrefix        = "Digest"
+	qopAuth             = "auth"
+	qopAuthInt          = "auth-int"
 )
 
 type nonceCounter uint32
 
-var maxNonceCounter nonceCounter
+var (
+	maxNonceCounter           nonceCounter
+	regexDigestChallengeParam = regexp.MustCompile(`\w+\="([^"])*"`)
+)
 
 func init() {
 	maxVal, _ := strconv.ParseInt("ffffffff", 16, 64)
@@ -31,36 +34,96 @@ func init() {
 }
 
 type httpCaller interface {
-	// Get(url string) (resp *http.Response, err error)
-	Do(req *http.Request) (resp *http.Response, err error)
+	Do(*http.Request) (*http.Response, error)
 }
 
-type DigestAuthClient struct {
+// Client holds the details need to respond to digest auth challenge and generate a auth request
+type Client struct {
 	httpCaller
 	*digestChallenge
 	username, password string
-
-	Cnonce string
-	NC     nonceCounter
-	QOP    string
+	nc                 nonceCounter
+	qop                string
 }
 
-func (dac *DigestAuthClient) Conn(uri string) error {
+// https://tools.ietf.org/html/rfc2617
+// 3.2.1 The WWW-Authenticate Response Header
+type digestChallenge struct {
+	Realm, Domain, Nonce, Opaque, Stale, Algorithm string
+	QOPOptions                                     []string `json:"qop"`
+}
+
+// https://tools.ietf.org/html/rfc2617
+// 3.2.2 The Authorization Request Header
+type digestResponse struct {
+	Username, Realm, Nonce, URI, Response, Algorithm, Cnonce, Opaque, QOP, NC string
+}
+
+// NewClient initializes a new client with http.DefaultClient and username/password
+func NewClient(username, password string) *Client {
+	return &Client{
+		httpCaller: http.DefaultClient,
+		username:   username,
+		password:   password,
+	}
+}
+
+// WithHTTPClient is used to optional set the client with a different httpCaller
+func (c *Client) WithHTTPClient(hc httpCaller) *Client {
+	c.httpCaller = hc
+	return c
+}
+
+// ApplyAuth will set an authorization header to the request.
+func (c *Client) ApplyAuth(req *http.Request) error {
 	var err error
 
-	req, err := http.NewRequest(http.MethodGet, uri, nil)
+	// first request off the client may need to initiate and process the challenge
+	if c.digestChallenge == nil {
+		if err = c.getDigestChallenge(req); err != nil {
+			return err
+		}
+	}
+
+	// generate a response
+	dr, err := c.response(req.Method, req.URL.RequestURI(), req.Body)
 	if err != nil {
 		return err
 	}
 
-	resp, err := dac.Do(req)
+	// generate the header
+	hdrVal := dr.printHeaderVal()
+	if c.Opaque != "" {
+		hdrVal = fmt.Sprintf(`%s, opaque="%s"`, hdrVal, c.Opaque)
+	}
+
+	// apply the header
+	req.Header.Set(authHeader, hdrVal)
+
+	return nil
+}
+
+// AuthedDo will set an authorization header to the request, and call it with the Client httpCaller
+func (c *Client) AuthedDo(req *http.Request) (*http.Response, error) {
+	// apply auth to request header
+	if err := c.ApplyAuth(req); err != nil {
+		return nil, err
+	}
+
+	// make request
+	return c.Do(req)
+}
+
+func (c *Client) getDigestChallenge(req *http.Request) error {
+	// make request to get a challenge response
+	resp, err := c.Do(req)
 	if err != nil {
 		return err
 	}
 
 	// expect HTTP/1.1 401 Unauthorized
 	if resp.StatusCode != http.StatusUnauthorized {
-		return fmt.Errorf("expected %s to respond with status code %v, but got %v", uri, http.StatusUnauthorized, resp.StatusCode)
+		return fmt.Errorf("expected %s to respond with status code %v, but got %v", req.URL.Host, http.StatusUnauthorized, resp.StatusCode)
 	}
 
 	// read 'WWW-Authenticate' val from header
@@ -70,43 +133,26 @@ func (dac *DigestAuthClient) Conn(uri string) error {
 	}
 
 	// read challenge info
-	dac.digestChallenge, err = readChallenge(hdrVal)
+	c.digestChallenge, err = readChallenge(hdrVal)
 	if err != nil {
 		return fmt.Errorf("there was a problem reading the digest challenge: %s", err.Error())
 	}
-	fmt.Printf("challengeVal: %#v\n", dac.digestChallenge)
-
-	// generate a client nonce
-	dac.Cnonce, err = generateNonce()
-	if err != nil {
-		return err
-	}
 
 	// choose QOP response from options
-	dac.QOP = dac.determineQOP()
-
-	req, err = http.NewRequest(http.MethodGet, uri, nil)
-	if err != nil {
-		return err
-	}
-
-	// challengeResp := dac.response(req.Method, req.URL.RequestURI(), req.Body)
-	// fmt.Printf("challengeResp: %#v\n", challengeResp)
-
-	dac.ApplyAuth(req)
-
+	c.qop = c.determineQOP()
 	return nil
 }
 
-func (dac DigestAuthClient) determineQOP() string {
-	qopSupportsAuth := sliceContainsString(dac.QOPOptions, "auth")
-	qopSupportsAuthInt := sliceContainsString(dac.QOPOptions, "auth-int")
+// will choose "auth" > "auth-in"
+func (c *Client) determineQOP() string {
+	qopSupportsAuth := sliceContainsString(c.QOPOptions, qopAuth)
+	qopSupportsAuthInt := sliceContainsString(c.QOPOptions, qopAuthInt)
 
 	if qopSupportsAuth {
-		return "auth"
+		return qopAuth
 	}
 	if qopSupportsAuthInt {
-		return "auth-in"
+		return qopAuthInt
 	}
 	return ""
 }
@@ -118,10 +164,9 @@ func readChallenge(s string) (*digestChallenge, error) {
 	s = strings.TrimPrefix(s, digestPrefix)
 
 	m := map[string]interface{}{}
-	re := regexp.MustCompile(`\w+\="([^"])*"`)
-	for _, pair := range re.FindAllString(s, -1) {
+	for _, pair := range regexDigestChallengeParam.FindAllString(s, -1) {
 		kv := strings.SplitN(pair, "=", 2)
-		val, err := cleanValue(kv[1])
+		val, err := cleanUpValue(kv[1])
 		if err != nil {
 			return nil, fmt.Errorf("problem parsing header; %s", err.Error())
 		}
@@ -141,7 +186,7 @@ func readChallenge(s string) (*digestChallenge, error) {
 	return resp, nil
 }
 
-func cleanValue(s string) (interface{}, error) {
+func cleanUpValue(s string) (interface{}, error) {
 	s = strings.TrimSpace(s)
 	if strings.HasPrefix(s, `"`) {
 		var err error
@@ -161,32 +206,11 @@ func cleanValue(s string) (interface{}, error) {
 	return resp, nil
 }
 
-// 3.2.1 The WWW-Authenticate Response Header
-type digestChallenge struct {
-	Realm, Domain, Nonce, Opaque, Stale, Algorithm string
-	QOPOptions                                     []string `json:"qop"`
-}
-
 // initialize w/ defaults
 func newDigestChallenge() *digestChallenge {
 	return &digestChallenge{
 		Algorithm: "MD5",
 	}
-}
-
-// 3.2.2 The Authorization Request Header
-type digestResponse struct {
-	Username, Realm, Nonce, URI, Response, Algorithm, Cnonce, Opaque, QOP, NC string
-}
-
-func (dac *DigestAuthClient) ApplyAuth(req *http.Request) {
-	hdrVal := dac.response(req.Method, req.URL.RequestURI(), req.Body).printHeaderVal()
-
-	if dac.Opaque != "" {
-		hdrVal = fmt.Sprintf(`%s, opaque="%s"`, hdrVal, dac.Opaque)
-	}
-	fmt.Println("hdrVal", hdrVal)
-	req.Header.Set(authHeader, hdrVal)
 }
 
 func (dr *digestResponse) printHeaderVal() string {
@@ -204,75 +228,69 @@ func (dr *digestResponse) printHeaderVal() string {
 	return hdrVal
 }
 
-func (dac *DigestAuthClient) response(reqMethod, reqPath string, reqBody io.ReadCloser) *digestResponse {
+func (c *Client) response(reqMethod, reqPath string, reqBody io.ReadCloser) (*digestResponse, error) {
 	// If the qop directive's value is "auth" or "auth-int", then compute the response as follows:
 	// response=MD5(HA1:nonce:nonceCount:cnonce:qop:HA2)
 	// If the qop directive is unspecified, then compute the response as follows:
 	// response=MD5(HA1:nonce:HA2)
 
-	dac.incrCounter()
+	// generate a client nonce
+	cnonce, err := generateNonce()
+	if err != nil {
+		return nil, err
+	}
+
+	nc, err := c.incrNC()
+	if err != nil {
+		return nil, err
+	}
+
 	resp := &digestResponse{
-		Username:  dac.username,
-		Realm:     dac.Realm,
-		Nonce:     dac.Nonce,
+		Username:  c.username,
+		Realm:     c.Realm,
+		Nonce:     c.Nonce,
 		URI:       reqPath,
-		Algorithm: dac.Algorithm,
-		Opaque:    dac.Opaque,
+		Algorithm: c.Algorithm,
+		Opaque:    c.Opaque,
 	}
 
-	ha1 := dac.ha1()
-	ha2 := dac.ha2(reqMethod, reqPath, reqBody)
-	hash := md5.New()
-	if dac.QOP != "" {
-		io.WriteString(hash, fmt.Sprintf("%s:%s:%s:%s:%s:%s", ha1, dac.Nonce, dac.NC.printHex(), dac.Cnonce, dac.QOP, ha2))
-		resp.Cnonce = dac.Cnonce
-		resp.QOP = dac.QOP
-		resp.NC = dac.NC.printHex()
+	ha1 := c.ha1(cnonce)
+	ha2 := c.ha2(reqMethod, reqPath, reqBody)
+	if c.qop != "" {
+		resp.Response = toMD5(fmt.Sprintf("%s:%s:%s:%s:%s:%s", ha1, c.Nonce, nc, cnonce, c.qop, ha2))
+		resp.Cnonce = cnonce
+		resp.QOP = c.qop
+		resp.NC = nc
 	}
-	io.WriteString(hash, fmt.Sprintf("%s:%s:%s", ha1, dac.Nonce, ha2))
+	resp.Response = toMD5(fmt.Sprintf("%s:%s:%s", ha1, c.Nonce, ha2))
 
-	resp.Response = fmt.Sprintf("%x", hash.Sum(nil))
-
-	return resp
+	return resp, nil
 }
 
-func (dac *DigestAuthClient) ha1() string {
+func (c *Client) ha1(cnonce string) string {
+	ha1 := toMD5(fmt.Sprintf("%s:%s:%s", c.username, c.Realm, c.password))
 	// If the algorithm directive's value is "MD5" or unspecified, then HA1 is
 	// HA1=MD5(username:realm:password)
-
-	// If the algorithm directive's value is "MD5-sess", then HA1 is
-	// HA1=MD5(MD5(username:realm:password):nonce:cnonce)
-	hash := md5.New()
-	io.WriteString(hash, fmt.Sprintf("%s:%s:%s", dac.username, dac.Realm, dac.password))
-	ha1 := fmt.Sprintf("%x", hash.Sum(nil))
-
-	if dac.Algorithm != "MD5-sess" {
+	if c.Algorithm != "MD5-sess" {
 		return ha1
 	}
-
-	outerHash := md5.New()
-	io.WriteString(outerHash, fmt.Sprintf("%s:%s:%s", ha1, dac.Nonce, dac.Cnonce))
-	return fmt.Sprintf("%x", hash.Sum(nil))
+	// If the algorithm directive's value is "MD5-sess", then HA1 is
+	// HA1=MD5(MD5(username:realm:password):nonce:cnonce)
+	return toMD5(fmt.Sprintf("%s:%s:%s", ha1, c.Nonce, cnonce))
 }
 
-func (dac *DigestAuthClient) ha2(reqMethod, reqPath string, reqBody io.ReadCloser) string {
-	// 	If the qop directive's value is "auth" or is unspecified, then HA2 is
-	// 	HA2=MD5(method:digestURI)
-
+func (c *Client) ha2(reqMethod, reqPath string, reqBody io.ReadCloser) string {
 	// 	If the qop directive's value is "auth-int", then HA2 is
 	// 	HA2=MD5(method:digestURI:MD5(entityBody))
-
-	hash := md5.New()
-	if dac.QOP != "auth-int" {
-		io.WriteString(hash, fmt.Sprintf("%s:%s", reqMethod, reqPath))
-	} else {
+	if c.qop == qopAuthInt {
 		hashEntityBody := md5.New()
 		io.Copy(hashEntityBody, reqBody)
-		entityBody := fmt.Sprintf("%x", hashEntityBody.Sum(nil))
-		io.WriteString(hash, fmt.Sprintf("%s:%s:%s", reqMethod, reqPath, entityBody))
+		return toMD5(fmt.Sprintf("%s:%s:%s", reqMethod, reqPath, hashToString(hashEntityBody)))
 	}
 
-	return fmt.Sprintf("%x", hash.Sum(nil))
+	// 	If the qop directive's value is "auth" or is unspecified, then HA2 is
+	// 	HA2=MD5(method:digestURI)
+	return toMD5(fmt.Sprintf("%s:%s", reqMethod, reqPath))
 }
 
 func generateNonce() (string, error) {
@@ -283,18 +301,16 @@ func generateNonce() (string, error) {
 		return "", err
 	}
 
-	hash := md5.New()
-	io.WriteString(hash, string(b))
-	return strings.TrimSpace(fmt.Sprintf("%x\n", hash.Sum(nil))), nil
+	return toMD5(string(b)), nil
 }
 
-func (dac *DigestAuthClient) incrCounter() (string, error) {
-	if dac.NC > maxNonceCounter {
-		return "", fmt.Errorf("nonce counter is too large: %v", dac.NC)
+func (c *Client) incrNC() (string, error) {
+	if c.nc > maxNonceCounter {
+		return "", fmt.Errorf("nonce counter is too large: %v", c.nc)
 
 	}
-	dac.NC++
-	return dac.NC.printHex(), nil
+	c.nc++
+	return c.nc.printHex(), nil
 }
 
 func (nc nonceCounter) printHex() string {
@@ -308,4 +324,14 @@ func sliceContainsString(slice []string, s string) bool {
 		}
 	}
 	return false
+}
+
+func toMD5(s string) string {
+	hash := md5.New()
+	io.WriteString(hash, s)
+	return hashToString(hash)
+}
+
+func hashToString(h hash.Hash) string {
+	return fmt.Sprintf("%x", h.Sum(nil))
 }
